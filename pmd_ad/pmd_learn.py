@@ -30,9 +30,6 @@ import gc
 device_ids = [0]
 torch.cuda.set_device(device_ids[0])
 
-# データ作成フラグ
-make_flag = False
-
 # ファイルパス
 DATA_DIR = './PMD'
 
@@ -47,13 +44,13 @@ y_test_dir = os.path.join(DATA_DIR, 'test/mask')
 # 入力画像の処理
 # image
 img_transform = transforms.Compose([
-    transforms.Resize((224, 224)),
+    transforms.Resize((416, 416)),
     transforms.ToTensor(),
     transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
 ])
 # mask,mask_edge
 img_label_transform = transforms.Compose({
-    transforms.Resize((224,224)),
+    transforms.Resize((416,416)),
     transforms.ToTensor()
 })
 
@@ -73,8 +70,8 @@ scheduler_poly_lr_decay = PolynomialLRDecay(optimizer, max_decay_steps=100, end_
 criterion = PMD_LOSS()               # 損失関数
 
 """ (4) モデル学習 """
-mini_batch = 10 # batch_size
-repeat = 150   # エポック数
+mini_batch = 7 # batch_size
+repeat = 50   # エポック数
 
 """ 学習中の評価（グラフ用）リスト"""
 epoch_list = [] 
@@ -96,6 +93,10 @@ for epoch in range(repeat):
     print('\nEpoch: {}'.format(epoch+1))
 
     torch.backends.cudnn.benchmark = True
+
+    train_loss = 0
+    iou = 0
+
     model.train() #訓練モード
 
     bar = tqdm(total = train_size)
@@ -124,42 +125,41 @@ for epoch in range(repeat):
         optimizer.step()
         scheduler_poly_lr_decay.step()
 
-        # 現在のIoUを表示
-        '''
-        IoUでは予測データが予測値がほぼ１になる問題がある。
-        preds = (torch.nn.functional.sigmoid(pred[5]) > 0.5).long() # 閾値を0.5に設定
-        print("現在のIoU : {}" .format(iou_binary(preds,target)))
-        print("現在のLoss: {}\n".format(loss.item()) )
-        '''
-        
-    elasped_time = time.time() - start
-    print("elapsed_time:{} sec\n".format(elasped_time) )
-    print("評価関数の計算...\n")
-    # 評価関数(IoU)
+        # loss
+        preds = (torch.nn.functional.sigmoid(pred[5]) > 0.5).long()
+        iou += iou_binary(preds,target)
+        train_loss += loss.item()
+
+
+    # 評価ステップ
+    train_loss /= len(train_dataset)
+    iou /= len(train_dataset)
+    print("Train_Loss:{}, Train_IoU:{}".format(train_loss,iou))
+    
     '''検証データを使用してIoUを算出'''
     model.eval() #評価モード
-    iou = 0    
+    val_iou = 0
     with torch.no_grad(): # 勾配の計算しない
-        for image, mask, edge in tqdm(torch.utils.data.DataLoader(val_dataset,batch_size=1,shuffle=True,num_workers=2, pin_memory = True)):                   
+        for image, mask, edge in tqdm(torch.utils.data.DataLoader(val_dataset,batch_size=1,num_workers=2, pin_memory = True)):                   
             pred = model(image.cuda())
             mask = mask.cuda()
             preds = (torch.nn.functional.sigmoid(pred[5]) > 0.5).long()  # 閾値 0.5
             iou += iou_binary(preds, mask) # output[5] は　final_map
             
-    mIoU = iou / len(val_dataset) # IoUの平均値を求める。
-    # 評価関数
-    print("IoU:{}".format(mIoU)) # IoU
-    print("loss:{}".format(loss.item())) # Loss
+    val_iou /= len(val_dataset) 
+    print("Val_IoU:{}".format(val_iou)) # IoU
+    
     epoch_list.append(epoch)
-    loss_list.append(loss.item())
-    iou_list.append(mIoU)
+    loss_list.append(train_loss.item())
+    iou_list.append(val_iou)
 
 
     '''
     問題点２：評価関数にF1_scoreとMAEを実装できていない。
     本来ならば評価関数にはF1_scoreとMAEを使用
-    '''
+https://canary.discord.com/7a0b734a-9633-4108-830e-8598cdbde225    '''
 
+pdb.set_trace()
 """学習状況をグラフで作成"""
 eval.plot_iou(epoch_list, iou_list)
 eval.plot_loss(epoch_list, loss_list)
@@ -167,9 +167,9 @@ eval.plot_loss(epoch_list, loss_list)
 
 
 """ (5)モデルの結果を出力 """
-torch.save(model.state_dict(), "sample.model")    # モデル保存する場合
-model.load_state_dict(torch.load("sample.model")) # モデルを呼び出す場合
-pdb.set_trace()
+torch.save(model.state_dict(), "pmd_model.pth")    # モデル保存する場合
+model.load_state_dict(torch.load("pmd_model.pth")) # モデルを呼び出す場合
+
 
 
 """ (6) モデルの性能評価 """
