@@ -3,6 +3,7 @@ from model.pmd import PMD
 import torch
 from torch import optim
 import torch.nn as nn
+from torch_poly_lr_decay import PolynomialLRDecay
 
 import pdb
 
@@ -18,7 +19,7 @@ from loss.loss import iou_binary
 import time
 
 import pickle
-
+import dataset
 import eval
 from tqdm import tqdm
 
@@ -42,83 +43,37 @@ y_edge_train_dir = os.path.join(DATA_DIR, 'train/edge')
 x_test_dir = os.path.join(DATA_DIR, 'test/image')
 y_test_dir = os.path.join(DATA_DIR, 'test/mask')
 
-X_train = os.listdir(x_train_dir) # 訓練画像
-Y_train = os.listdir(y_train_dir) # マスク画像
-Y_edge_train = os.listdir(y_edge_train_dir) # マスクエッジ画像
-
 '''(2) データ作成'''
 # 入力画像の処理
 # image
 img_transform = transforms.Compose([
-    transforms.Resize((416, 416)),
+    transforms.Resize((224, 224)),
     transforms.ToTensor(),
     transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
 ])
 # mask,mask_edge
 img_label_transform = transforms.Compose({
-    transforms.Resize((416,416)),
+    transforms.Resize((224,224)),
     transforms.ToTensor()
 })
 
-# データ作成
-if make_flag:
-    train_list=[] # 訓練画像
-    mask_list=[] # マスク画像
-    edge_list=[] # エッジ画像
+# image data set
+dataset = dataset.PmdDataset(x_train_dir,y_train_dir,y_edge_train_dir,img_transform,img_label_transform)
 
-    for file in X_train:
+train_size = int(dataset.__len__() * 0.8) # train data 8割
+val_size   = dataset.__len__() - train_size # validation data 2割
 
-        # 訓練画像
-        train_img=Image.open(os.path.join(x_train_dir,file))
-        if train_img.mode != 'RGB':
-            train_img = train_img.convert('RGB')
-            print("{} is a gray image.".format(file))
-        train_list.append(img_transform(train_img))
+train_dataset, val_dataset = torch.utils.data.random_split(dataset, [train_size, val_size])
 
-        # マスク画像
-        img_label = Image.open(os.path.join(y_train_dir,(os.path.splitext(os.path.basename(file))[0] + '.png')))
-        img_label = img_label.convert("1") # グレースケールの画像
-        mask_list.append(img_label_transform(img_label))
-
-        # エッジ画像
-        img_edge_label = Image.open(os.path.join(y_edge_train_dir,(os.path.splitext(os.path.basename(file))[0] + '.png')))
-        img_edge_label = img_edge_label.convert("1") # グレースケールの画像
-        edge_list.append(img_label_transform(img_edge_label))
-
-    img_array = torch.stack(train_list)
-    mask_array = torch.stack(mask_list)
-    edge_array = torch.stack(edge_list)
-
-    with open('train_data.pickle','wb') as w: # 訓練画像、マスク画像、 エッジ画像
-        pickle.dump(img_array, w)
-        pickle.dump(mask_array, w)
-        pickle.dump(edge_array, w)
-
-with open('train_data.pickle', 'rb') as r:
-    img_tensor = pickle.load(r)  # img_array (N,3,H,W)
-    mask_tensor = pickle.load(r) # mask array (N,1,H,W)
-    edge_tensor = pickle.load(r) # edge_array (N,1,H,W)
-
-# データセットの作成
-data_size  = len(X_train)           # データのサイズ
-train_split = int(data_size * 3/4)   # ミニバッチサイズ(全データの3/4を学習に利用)
-Dataset = torch.utils.data.TensorDataset(img_tensor, mask_tensor, edge_tensor)
-train_dataset, valid_dataset = torch.utils.data.random_split(Dataset,[train_split,data_size - train_split])
-
-# Memory Delete
-del img_tensor
-del mask_tensor
-del edge_tensor
-del Dataset
-gc.collect()
 
 """ (3)モデルとパラメータ探索アルゴリズムの設定 """
 model     = PMD().cuda(device_ids[0])                # モデル
 optimizer = optim.SGD(model.parameters(),lr=1e-3,momentum=0.9,weight_decay=5e-4) # パラメータ探索アルゴリズム(確率的勾配降下法 + 学習率lr=0.05を適用)
+scheduler_poly_lr_decay = PolynomialLRDecay(optimizer, max_decay_steps=100, end_learning_rate=0.0001, power=0.9) # 学習率のスケジューラ
 criterion = PMD_LOSS()               # 損失関数
 
 """ (4) モデル学習 """
-mini_batch = 5 # batch_size
+mini_batch = 10 # batch_size
 repeat = 150   # エポック数
 
 """ 学習中の評価（グラフ用）リスト"""
@@ -143,10 +98,10 @@ for epoch in range(repeat):
     torch.backends.cudnn.benchmark = True
     model.train() #訓練モード
 
-    bar = tqdm(total = train_split)
+    bar = tqdm(total = train_size)
     bar.set_description('Progress rate')    
-
-    for image, mask, edge in tqdm(torch.utils.data.DataLoader(train_dataset,batch_size=mini_batch,shuffle=True,num_workers=os.cpu_count(), pin_memory= True)): # すべてのデータセット分だけ実行
+    
+    for image, mask, edge in tqdm(torch.utils.data.DataLoader(train_dataset,batch_size=mini_batch,shuffle=True,num_workers=2, pin_memory= True)): # すべてのデータセット分だけ実行
         
         # 勾配を初期化
         optimizer.zero_grad()
@@ -158,7 +113,7 @@ for epoch in range(repeat):
 
         # モデルのforward関数を用いた準伝播の予測→出力値算出
         pred = model(img_var) # layer4_predict, layer3_predict, layer2_predict, layer1_predict, layer0_edge, final_predict 
-
+        
         # 上記出力値(output)と教師データ(target)を損失関数に渡し、損失関数を計算
         loss = criterion(pred[0], pred[1], pred[2], pred[3], pred[4],pred[5], target, target_edge)
         
@@ -167,32 +122,31 @@ for epoch in range(repeat):
 
         # 学習結果に基づきパラメータを更新
         optimizer.step()
-
-        # タスクバー表示
-        time.sleep(10)
+        scheduler_poly_lr_decay.step()
 
         # 現在のIoUを表示
-        '''IoUでは予測データが予測値がほぼ１になる問題がある。'''
+        '''
+        IoUでは予測データが予測値がほぼ１になる問題がある。
         preds = (torch.nn.functional.sigmoid(pred[5]) > 0.5).long() # 閾値を0.5に設定
         print("現在のIoU : {}" .format(iou_binary(preds,target)))
         print("現在のLoss: {}\n".format(loss.item()) )
-
+        '''
+        
     elasped_time = time.time() - start
     print("elapsed_time:{} sec\n".format(elasped_time) )
-
     print("評価関数の計算...\n")
     # 評価関数(IoU)
     '''検証データを使用してIoUを算出'''
     model.eval() #評価モード
     iou = 0    
     with torch.no_grad(): # 勾配の計算しない
-        for image, mask, edge in tqdm(torch.utils.data.DataLoader(valid_dataset,batch_size=1,shuffle=True,num_workers=2)):                   
-            pred = (model(image.cuda())[5] > 0).long()
+        for image, mask, edge in tqdm(torch.utils.data.DataLoader(val_dataset,batch_size=1,shuffle=True,num_workers=2, pin_memory = True)):                   
+            pred = model(image.cuda())
             mask = mask.cuda()
             preds = (torch.nn.functional.sigmoid(pred[5]) > 0.5).long()  # 閾値 0.5
             iou += iou_binary(preds, mask) # output[5] は　final_map
             
-    mIoU = iou / len(valid_dataset) # IoUの平均値を求める。
+    mIoU = iou / len(val_dataset) # IoUの平均値を求める。
     # 評価関数
     print("IoU:{}".format(mIoU)) # IoU
     print("loss:{}".format(loss.item())) # Loss
