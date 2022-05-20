@@ -1,0 +1,7 @@
+*.png
+*.pickle # pickleファイルは無視
+PMD/
+MSD/
+result/
+result_sub/
+
